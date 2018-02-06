@@ -12,9 +12,14 @@ SG_CIDRIP_KEY = 'CidrIp'
 SG_GROUP_PAIR_KEY = 'UserIdGroupPairs'
 SG_GROUP_ID_KEY = 'GroupId'
 
+SG_COMPLIANT = 'COMPLIANT'
+SG_NON_COMPLIANT = 'NON_COMPLIANT'
+
+
 # parameter key
 DEBUG = 'debug'  # Boolean type, True or False.
 PERMIT_IP_RANGES = 'permit_ip_ranges'  # 10.0.0.0/24,10.0.1.0/25,...
+EVALUATE_TYPE = 'evaluate_type'
 
 
 # Already permitted security groupId list.
@@ -33,7 +38,7 @@ class NotPermitException(Exception):
     pass
 
 
-def evaluate_compliance(configuration_item, permit_ip_ranges):
+def evaluate_diff_compliance(configuration_item, permit_ip_ranges):
     """
     Evaluation compliance.
     If evaluation is correct return COMPLIANT, ohterwise return NON_COMPLIANT.
@@ -59,14 +64,52 @@ def evaluate_compliance(configuration_item, permit_ip_ranges):
 
     if is_permit_sg(group_id, permit_ip_ranges):
         return {
-            "compliance_type": "COMPLIANT",
+            "compliance_type": SG_COMPLIANT,
             "annotation": 'SecurityGroup {} ingress is corrected.'.format(group_id)
         }
     else:
         return {
-            "compliance_type" : "NON_COMPLIANT",
-            "annotation": 'SecurityGroup {} ingress is corrected.'.format(group_id)
+            "compliance_type" : SG_NON_COMPLIANT,
+            "annotation": 'SecurityGroup {} ingress is not corrected.'.format(group_id)
         }
+
+
+def evaluate_full_compliance(permit_ip_ranges):
+    """
+    Evaluation compliance.
+    If evaluation is correct return COMPLIANT, ohterwise return NON_COMPLIANT.
+    """
+
+    print('Full evaluate {} start')
+
+    ec2 = boto3.resource('ec2')
+    client = boto3.client("ec2");
+
+    result_list = []
+
+    for ec2_desc in client.describe_instances()['Reservations'][0]['Instances']:
+
+        instance_id = ec2_desc['InstanceId']
+        print('evaluate_full_compliance ec2: {}'.format(instance_id))
+
+        instance = ec2.Instance(instance_id)
+
+        for group_id in [sg['GroupId'] for sg in instance.security_groups]:
+
+            if is_permit_sg(group_id, permit_ip_ranges):
+                result_list.append({
+                    "group_id": group_id,
+                    "compliance_type": SG_COMPLIANT,
+                    "annotation": 'SecurityGroup {} of {} ingress is corrected.'.format(group_id, instance_id)
+                })
+            else:
+                result_list.append({
+                    "group_id": group_id,
+                    "compliance_type" : SG_NON_COMPLIANT,
+                    "annotation": 'SecurityGroup {} of {} ingress is not corrected.'.format(group_id, instance_id)
+                })
+
+    return result_list
 
 
 def is_permit_sg(group_id, permit_ip_ranges):
@@ -77,6 +120,9 @@ def is_permit_sg(group_id, permit_ip_ranges):
     
     global g_debug_enabled
     global g_checked_sg_ids
+
+
+    print('is_permit_sg: {}'.format(group_id))
 
     try:
         client = boto3.client("ec2");
@@ -188,39 +234,63 @@ def lambda_handler(event, context):
     lambda_handler
     """
 
-    invoking_event = json.loads(event['invokingEvent'])
-    configuration_item = invoking_event["configurationItem"]
     rule_parameters = json.loads(event["ruleParameters"])
 
 
     global g_debug_enabled
-
     if DEBUG in rule_parameters:
         g_debug_enabled = True if rule_parameters[DEBUG].lower() == 'true' else False
-    
-    if g_debug_enabled:
-        print("Received event: " + json.dumps(event, indent=2))
-
 
     if PERMIT_IP_RANGES in rule_parameters:
         permit_ip_ranges = list(map(lambda s: s.strip(), rule_parameters[PERMIT_IP_RANGES].split(',')))
     else:
         raise Exception("Must set parameter {}".format(PERMIT_IP_RANGES))
 
+    if EVALUATE_TYPE in rule_parameters:
+        evaluate_type = rule_parameters[EVALUATE_TYPE]
+    else:
+        raise Exception("Must set parameter {}".format(EVALUATE_TYPE))
 
-    evaluation = evaluate_compliance(configuration_item, permit_ip_ranges)
+    if g_debug_enabled:
+        print("Received event: " + json.dumps(event, indent=2))
+
 
     config = boto3.client('config')
 
-    response = config.put_evaluations(
-       Evaluations=[
-           {
-               'ComplianceResourceType': invoking_event['configurationItem']['resourceType'],
-               'ComplianceResourceId': invoking_event['configurationItem']['resourceId'],
-               'ComplianceType': evaluation["compliance_type"],
-               "Annotation": evaluation["annotation"],
-               'OrderingTimestamp': invoking_event['configurationItem']['configurationItemCaptureTime']
-           },
-       ],
-       ResultToken=event['resultToken'])
+    invoking_event = json.loads(event['invokingEvent'])
 
+
+    if evaluate_type == 'diff':
+
+        configuration_item = invoking_event["configurationItem"]
+
+        evaluation = evaluate_diff_compliance(configuration_item, permit_ip_ranges)
+
+        response = config.put_evaluations(
+           Evaluations=[
+               {
+                   'ComplianceResourceType': invoking_event['configurationItem']['resourceType'],
+                   'ComplianceResourceId': invoking_event['configurationItem']['resourceId'],
+                   'ComplianceType': evaluation["compliance_type"],
+                   "Annotation": evaluation["annotation"],
+                   'OrderingTimestamp': invoking_event['configurationItem']['configurationItemCaptureTime']
+               },
+           ],
+           ResultToken=event['resultToken'])
+
+    elif evaluate_type == 'full':
+
+        evaluation_list = evaluate_full_compliance(permit_ip_ranges)
+
+        return_eva_list = []
+        for eva in evaluation_list:
+            return_eva_list.append({
+               'ComplianceResourceType': APPLICABLE_RESOURCES[0],
+               'ComplianceResourceId': eva['group_id'],
+               'ComplianceType': eva["compliance_type"],
+               "Annotation": eva["annotation"],
+               'OrderingTimestamp': invoking_event['notificationCreationTime']
+            })
+
+        response = config.put_evaluations(
+                Evaluations = return_eva_list, ResultToken = event['resultToken'])
