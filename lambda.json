@@ -1,0 +1,10 @@
+{
+  "name": "aws_config_sg_check",
+  "description": "aws_config_sg_check",
+  "region": "ap-northeast-1",
+  "runtime": "python3.6",
+  "handler": "sg_check.lambda_handler",
+  "role": "arn:aws:iam::409646573355:role/admin-role",
+  "timeout": 300,
+  "memory": 128
+}
